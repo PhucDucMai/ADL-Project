@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data (keep structure, ignore content)
+data/raw/train/fight/*
+data/raw/train/normal/*
+data/raw/val/fight/*
+data/raw/val/normal/*
+data/processed/*
+data/temp_upload.*
+
+# Model checkpoints (large files)
+checkpoints/*.pth
+
+# Logs
+logs/*.log
+logs/*.png
+logs/*.json
+
+# OS files
+.DS_Store
+Thumbs.db

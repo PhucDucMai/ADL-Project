@@ -1,0 +1,44 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data content (keep directory structure)
+data/raw/train/fight/*
+data/raw/train/normal/*
+data/raw/val/fight/*
+data/raw/val/normal/*
+data/processed/*
+data/temp_upload.*
+!data/raw/train/fight/.gitkeep
+!data/raw/train/normal/.gitkeep
+!data/raw/val/fight/.gitkeep
+!data/raw/val/normal/.gitkeep
+
+# Model checkpoints
+checkpoints/*.pth
+
+# Logs (generated during training)
+logs/*.log
+logs/*.png
+logs/*.json
+
+# OS files
+.DS_Store
+Thumbs.db
