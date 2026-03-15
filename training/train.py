@@ -304,6 +304,23 @@ def train(config):
         sampling_mode="uniform",
     )
 
+    # Validate datasets before creating loaders
+    if len(train_dataset) == 0:
+        logger.error(
+            "No training samples found in %s. "
+            "Please add video files organized as: "
+            "<train_dir>/fight/*.avi and <train_dir>/normal/*.avi",
+            config.data.train_dir,
+        )
+        return
+
+    if len(val_dataset) == 0:
+        logger.warning(
+            "No validation samples found in %s. "
+            "Training will proceed without validation.",
+            config.data.val_dir,
+        )
+
     # Build data loaders
     train_loader = DataLoader(
         train_dataset,
@@ -314,13 +331,15 @@ def train(config):
         drop_last=True,
     )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        num_workers=config.training.num_workers,
-        pin_memory=True,
-    )
+    val_loader = None
+    if len(val_dataset) > 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.training.batch_size,
+            shuffle=False,
+            num_workers=config.training.num_workers,
+            pin_memory=True,
+        )
 
     logger.info("Train samples: %d, Val samples: %d", len(train_dataset), len(val_dataset))
 
@@ -383,7 +402,8 @@ def train(config):
 
         # Validate
         val_interval = config.training.get("val_interval", 1)
-        if (epoch + 1) % val_interval == 0:
+        run_val = val_loader is not None and (epoch + 1) % val_interval == 0
+        if run_val:
             val_loss, val_acc, val_preds, val_labels = validate(
                 model, val_loader, criterion, device, use_amp,
             )
@@ -446,18 +466,30 @@ def train(config):
                 checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pth",
             )
 
-    # Save final model
+    # Save final model (also as best_model if no validation was performed)
     save_checkpoint(
         model, optimizer, num_epochs - 1,
         tracker.get_summary(),
         checkpoint_dir / "final_model.pth",
     )
 
+    if val_loader is None:
+        save_checkpoint(
+            model, optimizer, num_epochs - 1,
+            {"train_loss": tracker.train_losses[-1], "train_acc": tracker.train_accuracies[-1]},
+            checkpoint_dir / "best_model.pth",
+        )
+        logger.info("No validation data was provided. Final model saved as best_model.pth")
+
     # Save metrics and plots
     tracker.save(str(log_dir / "training_metrics.json"))
     plot_training_curves(tracker, str(log_dir))
-    logger.info("Training complete. Best val accuracy: %.4f at epoch %d",
-                tracker.best_val_accuracy, tracker.best_epoch + 1)
+    if tracker.best_val_accuracy > 0:
+        logger.info("Training complete. Best val accuracy: %.4f at epoch %d",
+                    tracker.best_val_accuracy, tracker.best_epoch + 1)
+    else:
+        logger.info("Training complete. Final train accuracy: %.4f",
+                    tracker.train_accuracies[-1] if tracker.train_accuracies else 0.0)
 
 
 def main():
