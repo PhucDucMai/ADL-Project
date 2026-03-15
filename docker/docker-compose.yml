@@ -26,9 +26,6 @@ services:
               count: 1
               capabilities: [gpu]
     restart: unless-stopped
-    # For RTSP access, use host network mode
-    # Uncomment the following line if using RTSP streams:
-    # network_mode: host
 
   # Training service (run with: docker compose run training)
   training:
@@ -36,6 +33,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     container_name: fight-detection-training
+    shm_size: "8gb"
     volumes:
       - ../data:/app/data
       - ../checkpoints:/app/checkpoints
@@ -51,7 +49,6 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    command: >
-      python -m training.train --config configs/default.yaml
+    command: python -m training.train --config configs/default.yaml
     profiles:
       - training
