@@ -1,4 +1,4 @@
-# Fighting Behavior Detection System (Latest)
+# Fighting Behavior Detection System
 
 A deep learning project for detecting fighting behavior in surveillance videos, with training and inference support for multiple video models, Streamlit visualization, Docker deployment, and reproducible experiment outputs.
 
