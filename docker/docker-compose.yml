@@ -8,23 +8,26 @@ services:
     container_name: fight-detection
     ports:
       - "8501:8501"
+    user: "1000:1000"
     volumes:
-      # Mount data directory for training data and checkpoints
       - ../data:/app/data
       - ../checkpoints:/app/checkpoints
       - ../logs:/app/logs
       - ../configs:/app/configs
+      - ../ui:/app/ui
+      - ../inference:/app/inference
+      - ../models:/app/models
+      - ../utils:/app/utils
+      - ../training:/app/training
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
-    # GPU support: requires nvidia-container-toolkit
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      - HOME=/home/appuser
+      - STREAMLIT_HOME=/home/appuser/.streamlit
+      - XDG_CONFIG_HOME=/home/appuser/.config
+    gpus: all
+    shm_size: "6gb"
+    ipc: host
     restart: unless-stopped
 
   # Training service (run with: docker compose run training)
@@ -33,15 +36,23 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     container_name: fight-detection-training
-    shm_size: "8gb"
+    shm_size: "6gb"
     volumes:
       - ../data:/app/data
       - ../checkpoints:/app/checkpoints
       - ../logs:/app/logs
       - ../configs:/app/configs
+      - ../ui:/app/ui
+      - ../inference:/app/inference
+      - ../models:/app/models
+      - ../utils:/app/utils
+      - ../training:/app/training
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HOME=/home/appuser
+      - STREAMLIT_HOME=/home/appuser/.streamlit
+      - XDG_CONFIG_HOME=/home/appuser/.config
     deploy:
       resources:
         reservations:

@@ -1,0 +1,68 @@
+# Configuration for X3D-S Fighting Detection (Optimized for 6GB GPU)
+
+model:
+  name: "x3d_s"
+  source: "torch_hub"
+  num_classes: 2
+  pretrained: true
+  clip_length: 13      # Reduced from 16 for smaller memory footprint
+  frame_stride: 2
+  spatial_size: 224
+  dropout_rate: 0.5
+
+training:
+  batch_size: 2        # OPTIMIZED: Reduced from 8 for 6GB GPU (max ~1.2GB per batch)
+  num_epochs: 20
+  learning_rate: 0.005
+  weight_decay: 0.00005
+  optimizer: "sgd"
+  momentum: 0.9
+  lr_scheduler: "cosine"
+  warmup_epochs: 5
+  mixed_precision: true
+  amp_dtype: "float16" # Use FP16 for reduced memory
+  num_workers: 2       # OPTIMIZED: Reduced from 4 to avoid memory spikes
+  pin_memory: false    # OPTIMIZED: Disable for 6GB to save CPU-GPU transfer memory
+  checkpoint_dir: "checkpoints/x3d_s/"
+  log_dir: "logs/x3d_s/"
+  save_interval: 5
+  val_interval: 1
+  gradient_clip_norm: 1.0
+  label_smoothing: 0.1
+  freeze_backbone_epochs: 5
+
+  # NEW: Gradient accumulation to simulate larger batch
+  gradient_accumulation_steps: 4  # Simulates batch_size=8 (2*4)
+
+  # NEW: Memory optimization
+  max_grad_norm: 1.0
+  cudnn_benchmark: true  # Optimize CUDA operations
+
+data:
+  train_dir: "data/raw/train"
+  val_dir: "data/raw/val"
+  test_dir: "data/raw/test"
+  clip_length: 13
+  frame_stride: 2
+  spatial_size: 224
+  classes:
+    - "normal"
+    - "fight"
+  random_horizontal_flip: true
+  color_jitter: false  # OPTIMIZED: Disable to save memory during augmentation
+  random_crop_scale_min: 0.8
+  random_crop_scale_max: 1.0
+  # Disable complex augmentations to save memory
+  prefetch_factor: 1   # Reduce prefetch buffer
+
+inference:
+  model_path: "checkpoints/x3d_s/best_model.pth"
+  confidence_threshold: 0.6
+  device: "cuda"
+  clip_length: 13
+  frame_stride: 2
+  spatial_size: 224
+  buffer_size: 64      # Reduced from 128
+  inference_interval: 8
+  warning_display_frames: 30
+  temporal_smoothing_window: 3

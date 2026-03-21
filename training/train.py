@@ -6,16 +6,20 @@ Supports:
     - Backbone freezing for transfer learning
     - Gradient clipping
     - Label smoothing
-    - Checkpoint saving (best and periodic)
+    - Checkpoint saving (best and periodic) organized by model and run
     - Training/validation loss and accuracy tracking
+    - Per-epoch confusion matrices and metadata tracking
 
 Usage:
     python -m training.train --config configs/default.yaml
 """
 
 import argparse
+import json
 import logging
 import time
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +38,18 @@ from utils.metrics import MetricsTracker, compute_classification_metrics
 from utils.visualization import plot_training_curves, plot_confusion_matrix
 
 logger = logging.getLogger(__name__)
+
+
+def generate_run_id() -> str:
+    """Generate a unique run ID combining timestamp and UUID.
+
+    Returns:
+        String in format: run_YYYYMMDD_HHMMSS_<uuid_first_8_chars>
+        Example: run_20260315_150230_a1b2c3d4
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    uuid_short = uuid.uuid4().hex[:8]
+    return f"run_{timestamp}_{uuid_short}"
 
 
 def build_optimizer(model, config):
@@ -131,8 +147,9 @@ def train_one_epoch(
     scaler: GradScaler,
     use_amp: bool,
     grad_clip_norm: float = 0.0,
+    grad_accumulation_steps: int = 1,
 ) -> tuple:
-    """Train for one epoch.
+    """Train for one epoch with gradient accumulation support.
 
     Args:
         model: The model to train.
@@ -143,6 +160,7 @@ def train_one_epoch(
         scaler: Gradient scaler for mixed precision.
         use_amp: Whether to use automatic mixed precision.
         grad_clip_norm: Max norm for gradient clipping. 0 to disable.
+        grad_accumulation_steps: Steps to accumulate gradients. Default: 1 (no accumulation).
 
     Returns:
         Tuple of (average_loss, accuracy).
@@ -151,31 +169,42 @@ def train_one_epoch(
     running_loss = 0.0
     correct = 0
     total = 0
+    accumulation_counter = 0
 
     for clips, labels in tqdm(dataloader, desc="Training", leave=False):
         clips = clips.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-
         with autocast(enabled=use_amp):
             outputs = model(clips)
             loss = criterion(outputs, labels)
+            # Scale loss by accumulation steps to maintain consistent gradient magnitude
+            loss = loss / grad_accumulation_steps
 
         if use_amp:
             scaler.scale(loss).backward()
-            if grad_clip_norm > 0:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-            scaler.step(optimizer)
-            scaler.update()
         else:
             loss.backward()
-            if grad_clip_norm > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-            optimizer.step()
 
-        running_loss += loss.item() * clips.size(0)
+        accumulation_counter += 1
+
+        # Update weights after accumulation
+        if accumulation_counter % grad_accumulation_steps == 0:
+            if use_amp:
+                if grad_clip_norm > 0:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if grad_clip_norm > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                optimizer.step()
+
+            optimizer.zero_grad()
+            accumulation_counter = 0
+
+        running_loss += loss.item() * grad_accumulation_steps * clips.size(0)
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
@@ -262,20 +291,34 @@ def save_checkpoint(
     logger.info("Checkpoint saved: %s", save_path)
 
 
-def train(config):
+def train(config, run_id: str = None):
     """Main training function.
 
     Args:
         config: Configuration object.
+        run_id: Unique run identifier. Generated if not provided.
     """
+    # Generate run_id if not provided
+    if run_id is None:
+        run_id = generate_run_id()
+
     # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Training on device: %s", device)
 
-    checkpoint_dir = Path(config.training.checkpoint_dir)
+    # Organize checkpoints and logs by model name and run_id
+    model_name = config.model.name
+    checkpoint_base = Path(config.training.checkpoint_dir)
+    checkpoint_dir = checkpoint_base / model_name / run_id
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    log_dir = Path(config.training.get("log_dir", "logs"))
+
+    log_base = Path(config.training.get("log_dir", "logs"))
+    log_dir = log_base / model_name / run_id
     log_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Run ID: %s", run_id)
+    logger.info("Checkpoint directory: %s", checkpoint_dir)
+    logger.info("Log directory: %s", log_dir)
 
     # Build transforms
     train_transform = get_train_transforms(config)
@@ -364,6 +407,15 @@ def train(config):
     # Gradient clipping
     grad_clip_norm = config.training.get("gradient_clip_norm", 0.0)
 
+    # Gradient accumulation
+    grad_accumulation_steps = config.training.get("gradient_accumulation_steps", 1)
+    if grad_accumulation_steps > 1:
+        logger.info(
+            "Gradient accumulation enabled: %d steps (simulates batch_size=%d)",
+            grad_accumulation_steps,
+            config.training.batch_size * grad_accumulation_steps,
+        )
+
     # Backbone freezing
     freeze_epochs = config.training.get("freeze_backbone_epochs", 0)
     if freeze_epochs > 0:
@@ -393,7 +445,7 @@ def train(config):
         # Train
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, device,
-            scaler, use_amp, grad_clip_norm,
+            scaler, use_amp, grad_clip_norm, grad_accumulation_steps,
         )
 
         # Get current learning rate
@@ -426,24 +478,31 @@ def train(config):
                 " [BEST]" if is_best else "",
             )
 
-            # Compute detailed metrics at last epoch
-            if epoch == num_epochs - 1:
+            # Compute and save detailed metrics at save intervals and final epoch
+            save_interval = config.training.get("save_interval", 5)
+            is_save_epoch = (epoch + 1) % save_interval == 0 or epoch == num_epochs - 1
+
+            if is_save_epoch:
                 class_metrics = compute_classification_metrics(
                     val_labels, val_preds, class_names=classes,
                 )
                 logger.info(
-                    "Final metrics - Accuracy: %.4f, Precision: %.4f, "
+                    "Epoch %d metrics - Accuracy: %.4f, Precision: %.4f, "
                     "Recall: %.4f, F1: %.4f",
+                    epoch + 1,
                     class_metrics["accuracy"],
                     class_metrics["precision"],
                     class_metrics["recall"],
                     class_metrics["f1_score"],
                 )
+                # Save per-epoch confusion matrix
+                cm_filename = f"confusion_matrix_epoch_{epoch + 1}.png"
                 plot_confusion_matrix(
                     np.array(class_metrics["confusion_matrix"]),
                     classes,
-                    str(log_dir / "confusion_matrix.png"),
+                    str(log_dir / cm_filename),
                 )
+                logger.info("Saved confusion matrix: %s", cm_filename)
         else:
             epoch_time = time.time() - epoch_start
             logger.info(
@@ -484,6 +543,43 @@ def train(config):
     # Save metrics and plots
     tracker.save(str(log_dir / "training_metrics.json"))
     plot_training_curves(tracker, str(log_dir))
+
+    # Save metadata about the training run
+    metadata = {
+        "run_id": run_id,
+        "model_name": config.model.name,
+        "model_source": config.model.get("source", "unknown"),
+        "timestamp": datetime.now().isoformat(),
+        "training_config": {
+            "batch_size": config.training.batch_size,
+            "num_epochs": config.training.num_epochs,
+            "learning_rate": config.training.learning_rate,
+            "optimizer": config.training.get("optimizer", "sgd"),
+            "warmup_epochs": config.training.get("warmup_epochs", 0),
+            "freeze_backbone_epochs": config.training.get("freeze_backbone_epochs", 0),
+        },
+        "model_config": {
+            "clip_length": config.model.clip_length,
+            "spatial_size": config.model.spatial_size,
+            "frame_stride": config.model.get("frame_stride", 2),
+            "pretrained": config.model.pretrained,
+            "num_classes": config.model.num_classes,
+        },
+        "best_epoch": tracker.best_epoch + 1 if tracker.best_epoch >= 0 else None,
+        "best_val_accuracy": float(tracker.best_val_accuracy) if tracker.best_val_accuracy > 0 else None,
+        "best_val_loss": float(tracker.best_val_loss) if tracker.best_val_loss > 0 else None,
+        "final_metrics": {
+            "train_loss": float(tracker.train_losses[-1]) if tracker.train_losses else None,
+            "train_accuracy": float(tracker.train_accuracies[-1]) if tracker.train_accuracies else None,
+            "val_loss": float(tracker.val_losses[-1]) if tracker.val_losses else None,
+            "val_accuracy": float(tracker.val_accuracies[-1]) if tracker.val_accuracies else None,
+        },
+    }
+    metadata_path = log_dir / "metadata.json"
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    logger.info("Metadata saved: %s", metadata_path)
+
     if tracker.best_val_accuracy > 0:
         logger.info("Training complete. Best val accuracy: %.4f at epoch %d",
                     tracker.best_val_accuracy, tracker.best_epoch + 1)
@@ -501,11 +597,23 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config)
-    log_dir = config.training.get("log_dir", "logs")
-    setup_logger("root", log_dir=log_dir)
-    setup_logger(__name__, log_dir=log_dir)
 
-    train(config)
+    # Generate unique run ID
+    run_id = generate_run_id()
+
+    # Setup logging
+    log_base = Path(config.training.get("log_dir", "logs"))
+    model_name = config.model.name
+    log_dir = log_base / model_name / run_id
+    setup_logger("root", log_dir=str(log_dir))
+    setup_logger(__name__, log_dir=str(log_dir))
+
+    logger.info("=" * 80)
+    logger.info("Starting training run: %s", run_id)
+    logger.info("Model: %s", model_name)
+    logger.info("=" * 80)
+
+    train(config, run_id=run_id)
 
 
 if __name__ == "__main__":

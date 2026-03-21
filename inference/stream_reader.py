@@ -168,6 +168,15 @@ class StreamReader:
 
             except av.error.InvalidDataError as e:
                 logger.error("Stream decode error: %s", str(e))
+                if not self.is_rtsp:
+                    # For files, corrupt data means the file is damaged past
+                    # this point — stop instead of re-opening from the start.
+                    logger.warning(
+                        "Corrupt data in video file at frame %d, stopping",
+                        self.frame_count,
+                    )
+                    self.running = False
+                    break
                 if self.running:
                     time.sleep(self.reconnect_delay)
 

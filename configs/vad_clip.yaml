@@ -1,0 +1,63 @@
+# Configuration for VAD-CLIP (Video Action Detection + CLIP) Fighting Detection
+
+model:
+  # Model architecture
+  name: "vad_clip"
+  source: "huggingface"  # Load from HuggingFace
+  num_classes: 2
+  pretrained: true
+  # VAD-CLIP optimal settings (Temporal ViT)
+  clip_length: 8       # Fewer frames, temporal modeling
+  frame_stride: 1
+  spatial_size: 224    # Standard ViT input
+  dropout_rate: 0.5
+
+training:
+  batch_size: 8
+  num_epochs: 20
+  learning_rate: 0.005
+  weight_decay: 0.00005
+  optimizer: "adamw"   # Recommended for ViT-based models
+  momentum: 0.9
+  lr_scheduler: "cosine"
+  warmup_epochs: 5
+  mixed_precision: true
+  num_workers: 4
+  checkpoint_dir: "checkpoints/vad_clip/"
+  log_dir: "logs/vad_clip/"
+  save_interval: 5
+  val_interval: 1
+  gradient_clip_norm: 1.0
+  label_smoothing: 0.1
+  freeze_backbone_epochs: 3
+
+data:
+  train_dir: "data/raw/train"
+  val_dir: "data/raw/val"
+  test_dir: "data/raw/test"
+  clip_length: 8       # Match model
+  frame_stride: 1
+  spatial_size: 224    # Match model
+  classes:
+    - "normal"
+    - "fight"
+  random_horizontal_flip: true
+  color_jitter: true
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.2
+  color_jitter_hue: 0.1
+  random_crop_scale_min: 0.8
+  random_crop_scale_max: 1.0
+
+inference:
+  model_path: "checkpoints/vad_clip/best_model.pth"
+  confidence_threshold: 0.6
+  device: "cuda"
+  clip_length: 8
+  frame_stride: 1
+  spatial_size: 224
+  buffer_size: 32
+  inference_interval: 4
+  warning_display_frames: 30
+  temporal_smoothing_window: 3

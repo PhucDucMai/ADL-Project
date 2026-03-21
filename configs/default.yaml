@@ -33,6 +33,7 @@ training:
 data:
   train_dir: "data/raw/train"
   val_dir: "data/raw/val"
+  test_dir: "data/raw/test"
   clip_length: 13
   frame_stride: 2
   spatial_size: 182

@@ -1,22 +1,58 @@
 """Streamlit-based user interface for fighting detection.
 
-Provides a web interface for:
-    - Selecting input source (RTSP stream or video file)
-    - Starting/stopping detection
-    - Viewing real-time results with warning overlays
+Two-phase workflow:
+    1. Detection: Process the entire video, running inference on sliding
+       window clips and building a per-frame fight/normal map.
+    2. Playback: Write an annotated video (red overlay on fight segments)
+       and play it back using Streamlit's native video player.
 
 Usage:
     streamlit run ui/app.py -- --config configs/default.yaml
 """
 
-import argparse
 import logging
+import os
 import sys
-import time
+import tempfile
+from fractions import Fraction
+from collections import deque
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
+import av
 import cv2
 import numpy as np
+
+
+def _ensure_streamlit_writable_home() -> None:
+    """Ensure Streamlit has a writable home/config directory.
+
+    Some container/runtime setups leave HOME unset (or set it to '/'), which
+    makes Streamlit attempt writing to '/.streamlit' and crash with
+    PermissionError. This function sets a safe fallback before importing
+    Streamlit.
+    """
+    home = os.environ.get("HOME", "").strip()
+    if not home or home == "/":
+        fallback_home = str(Path(tempfile.gettempdir()) / f"streamlit-home-{os.getuid()}")
+        os.makedirs(fallback_home, exist_ok=True)
+        os.environ["HOME"] = fallback_home
+
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if not xdg_config_home:
+        xdg_config_home = str(Path(os.environ["HOME"]) / ".config")
+        os.environ["XDG_CONFIG_HOME"] = xdg_config_home
+    os.makedirs(xdg_config_home, exist_ok=True)
+
+    streamlit_home = os.environ.get("STREAMLIT_HOME", "").strip()
+    if not streamlit_home:
+        streamlit_home = str(Path(os.environ["HOME"]) / ".streamlit")
+        os.environ["STREAMLIT_HOME"] = streamlit_home
+    os.makedirs(streamlit_home, exist_ok=True)
+
+
+_ensure_streamlit_writable_home()
+
 import streamlit as st
 
 # Add project root to path
@@ -25,17 +61,36 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from inference.detector import FightDetector
-from inference.stream_reader import StreamReader
 from utils.config import load_config
 from utils.logger import setup_logger
 
 logger = logging.getLogger(__name__)
 
+OUTPUT_DIR = Path("data/processed")
+
+
+def _sanitize_fps(fps: float) -> float:
+    """Return a safe, positive fps value for timeline math and encoding."""
+    if fps is None:
+        return 30.0
+    try:
+        fps = float(fps)
+    except (TypeError, ValueError):
+        return 30.0
+    if not np.isfinite(fps) or fps <= 0:
+        return 30.0
+    return fps
+
+
+def _fps_to_av_rate(fps: float) -> Fraction:
+    """Convert fps float to a Fraction supported by PyAV encoder streams."""
+    safe_fps = _sanitize_fps(fps)
+    return Fraction(str(round(safe_fps, 6))).limit_denominator(1000)
+
 
 def get_config():
     """Load configuration, checking command line args first."""
     config_path = "configs/default.yaml"
-    # Check for --config argument passed after '--' in streamlit command
     for i, arg in enumerate(sys.argv):
         if arg == "--config" and i + 1 < len(sys.argv):
             config_path = sys.argv[i + 1]
@@ -43,132 +98,339 @@ def get_config():
     return load_config(config_path)
 
 
-def init_session_state():
-    """Initialize Streamlit session state variables."""
-    defaults = {
-        "running": False,
-        "source": "",
-        "source_type": "Video File",
-        "reader": None,
-        "detector": None,
-        "frame_counter": 0,
-        "last_result": None,
-        "warning_countdown": 0,
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-
-def start_detection(config, source: str):
-    """Initialize and start the detection components.
-
-    Args:
-        config: Configuration object.
-        source: Video source path or RTSP URL.
-    """
-    # Stop existing components
-    stop_detection()
-
-    # Initialize stream reader
-    reader = StreamReader(
-        source=source,
-        buffer_size=config.inference.get("buffer_size", 64),
-    )
-    reader.start()
-
-    # Initialize detector
-    detector = FightDetector(config=config)
-
-    st.session_state.reader = reader
-    st.session_state.detector = detector
-    st.session_state.running = True
-    st.session_state.frame_counter = 0
-    st.session_state.last_result = None
-    st.session_state.warning_countdown = 0
-
-    logger.info("Detection started with source: %s", source)
-
-
-def stop_detection():
-    """Stop all detection components."""
-    if st.session_state.reader is not None:
-        st.session_state.reader.stop()
-        st.session_state.reader = None
-
-    if st.session_state.detector is not None:
-        st.session_state.detector.reset()
-        st.session_state.detector = None
-
-    st.session_state.running = False
-    logger.info("Detection stopped")
-
-
-def process_and_annotate(config) -> np.ndarray:
-    """Process the current frame and return an annotated image.
-
-    Args:
-        config: Configuration object.
+def count_video_frames(source: str) -> Tuple[int, float, int, int]:
+    """Count total frames and get video metadata.
 
     Returns:
-        Annotated frame in RGB format, or None.
+        Tuple of (total_frames, fps, width, height).
     """
-    reader = st.session_state.reader
-    detector = st.session_state.detector
+    container = av.open(source)
+    stream = container.streams.video[0]
+    fps = _sanitize_fps(float(stream.average_rate) if stream.average_rate else 30.0)
+    width = stream.codec_context.width
+    height = stream.codec_context.height
 
-    if reader is None or detector is None:
-        return None
+    # stream.frames can be 0 for some containers, so count manually
+    total = stream.frames
+    if total == 0:
+        try:
+            total = sum(1 for _ in container.decode(video=0))
+        except (av.error.InvalidDataError, av.error.EOFError) as e:
+            logger.warning("Partial file during frame counting: %s", e)
+    container.close()
 
-    frame = reader.get_frame()
-    if frame is None:
-        return None
+    return total, fps, width, height
 
-    st.session_state.frame_counter += 1
+
+def run_detection(
+    source: str,
+    config,
+    progress_bar,
+    status_text,
+) -> Tuple[List[Dict], int, float, int, int]:
+    """Run detection over the entire video.
+
+    Reads every frame, runs inference on sliding-window clips, and
+    returns a per-frame list of detection results.
+
+    Args:
+        source: Path to the video file (or RTSP URL).
+        config: Configuration object.
+        progress_bar: Streamlit progress bar widget.
+        status_text: Streamlit text widget for status updates.
+
+    Returns:
+        Tuple of (frame_results, total_frames, fps, width, height).
+        frame_results is a list with one dict per frame containing
+        'is_fight' (bool) and 'confidence' (float).
+    """
+    status_text.text("Counting frames...")
+    total_frames, fps, width, height = count_video_frames(source)
+    logger.info(
+        "Video: %d frames, %.1f fps, %dx%d", total_frames, fps, width, height,
+    )
+
+    status_text.text("Loading model...")
+    detector = FightDetector(config=config)
 
     clip_length = config.inference.get("clip_length", config.model.clip_length)
     frame_stride = config.inference.get("frame_stride", 2)
     inference_interval = config.inference.get("inference_interval", 8)
+    smoothing_window = config.inference.get("temporal_smoothing_window", 3)
 
-    # Run inference at the configured interval
-    if st.session_state.frame_counter % inference_interval == 0:
-        required = clip_length * frame_stride
-        frames = reader.get_frames(required)
+    # Per-frame results
+    frame_results: List[Dict] = []
 
-        if frames is not None:
-            indices = list(range(0, required, frame_stride))[:clip_length]
-            clip = frames[indices]
-            result = detector.predict_with_smoothing(clip)
-            st.session_state.last_result = result
+    # Rolling buffer for clip extraction
+    buffer_capacity = clip_length * frame_stride
+    frame_buffer: deque = deque(maxlen=buffer_capacity)
 
-            warning_frames = config.inference.get("warning_display_frames", 30)
-            if result["is_fight"]:
-                st.session_state.warning_countdown = warning_frames
+    # Current detection state (persists between inference calls)
+    current_result = {"is_fight": False, "confidence": 0.0, "probabilities": {"normal": 1.0, "fight": 0.0}}
 
-    # Annotate
-    display = frame.copy()
-    h, w = display.shape[:2]
+    status_text.text("Running detection...")
+    container = av.open(source)
+    frame_idx = 0
 
-    result = st.session_state.last_result
-    if result is not None:
-        prob_fight = result["probabilities"].get("fight", 0)
+    try:
+        for frame in container.decode(video=0):
+            img = frame.to_ndarray(format="rgb24")
+            frame_buffer.append(img)
+            frame_idx += 1
 
-        # Warning overlay
-        if st.session_state.warning_countdown > 0:
-            # Red tint overlay
-            red_overlay = np.zeros_like(display)
-            red_overlay[:, :, 0] = 255  # Red channel
-            alpha = 0.15
-            display = cv2.addWeighted(display, 1 - alpha, red_overlay, alpha, 0)
+            # Run inference when we have enough frames and at the configured interval
+            if len(frame_buffer) >= buffer_capacity and frame_idx % inference_interval == 0:
+                buffer_array = np.array(frame_buffer)
+                indices = list(range(0, buffer_capacity, frame_stride))[:clip_length]
+                clip = buffer_array[indices]
+                current_result = detector.predict_with_smoothing(clip)
 
-            # Red border
-            display[:6, :] = [255, 0, 0]
-            display[-6:, :] = [255, 0, 0]
-            display[:, :6] = [255, 0, 0]
-            display[:, -6:] = [255, 0, 0]
+            frame_results.append({
+                "is_fight": current_result["is_fight"],
+                "confidence": current_result["confidence"],
+                "fight_prob": current_result["probabilities"].get("fight", 0.0),
+            })
 
-            st.session_state.warning_countdown -= 1
+            # Update progress
+            if frame_idx % 10 == 0 or frame_idx == total_frames:
+                pct = min(frame_idx / max(total_frames, 1), 1.0)
+                progress_bar.progress(pct, text=f"Analyzing frame {frame_idx}/{total_frames}")
 
-    return display
+    except (av.error.InvalidDataError, av.error.EOFError) as e:
+        logger.warning(
+            "Video decode error at frame %d (processed %d frames): %s",
+            frame_idx, len(frame_results), e,
+        )
+        status_text.text(
+            f"Video has corrupt data at frame {frame_idx}. "
+            f"Continuing with {len(frame_results)} successfully decoded frames."
+        )
+    finally:
+        container.close()
+
+    progress_bar.progress(1.0, text="Detection complete")
+    status_text.text(f"Detection complete: {frame_idx} frames analyzed")
+
+    return frame_results, frame_idx, fps, width, height
+
+
+def propagate_fight_labels(
+    frame_results: List[Dict],
+    warning_duration_frames: int,
+) -> List[bool]:
+    """Propagate fight labels forward to create sustained highlight regions.
+
+    When a fight is detected, the highlight persists for
+    `warning_duration_frames` additional frames so that short clips
+    produce visible red regions during playback.
+
+    Args:
+        frame_results: Per-frame detection results.
+        warning_duration_frames: Number of extra frames to keep the highlight.
+
+    Returns:
+        Boolean list the same length as frame_results.
+    """
+    n = len(frame_results)
+    highlight = [False] * n
+    countdown = 0
+
+    for i in range(n):
+        if frame_results[i]["is_fight"]:
+            countdown = warning_duration_frames
+        if countdown > 0:
+            highlight[i] = True
+            countdown -= 1
+
+    return highlight
+
+
+def write_annotated_video(
+    source: str,
+    highlight_map: List[bool],
+    frame_results: List[Dict],
+    output_path: str,
+    fps: float,
+    progress_bar,
+    status_text,
+):
+    """Re-read the source video and write an annotated copy.
+
+    Fight-highlighted frames get a red tint, red border, and a
+    warning banner. The output is H.264 MP4 for browser playback.
+
+    Args:
+        source: Path to the original video.
+        highlight_map: Per-frame boolean indicating fight highlight.
+        frame_results: Per-frame results for confidence display.
+        output_path: Where to write the annotated video.
+        fps: Output frame rate.
+        progress_bar: Streamlit progress bar.
+        status_text: Streamlit status text.
+    """
+    total = len(highlight_map)
+    status_text.text("Writing annotated video...")
+
+    in_container = av.open(source)
+    out_container = av.open(output_path, mode="w")
+
+    in_stream = in_container.streams.video[0]
+    out_stream = out_container.add_stream("libx264", rate=_fps_to_av_rate(fps))
+    out_stream.width = in_stream.codec_context.width
+    out_stream.height = in_stream.codec_context.height
+    out_stream.pix_fmt = "yuv420p"
+    out_stream.options = {"crf": "23", "preset": "fast"}
+
+    frame_idx = 0
+    try:
+        for frame in in_container.decode(video=0):
+            if frame_idx >= total:
+                break
+
+            img = frame.to_ndarray(format="rgb24")
+
+            if highlight_map[frame_idx]:
+                img = _apply_fight_overlay(
+                    img,
+                    confidence=frame_results[frame_idx].get("confidence", 0.0),
+                )
+
+            # Encode frame
+            out_frame = av.VideoFrame.from_ndarray(img, format="rgb24")
+            for packet in out_stream.encode(out_frame):
+                out_container.mux(packet)
+
+            frame_idx += 1
+            if frame_idx % 10 == 0 or frame_idx == total:
+                pct = min(frame_idx / max(total, 1), 1.0)
+                progress_bar.progress(pct, text=f"Writing frame {frame_idx}/{total}")
+
+    except (av.error.InvalidDataError, av.error.EOFError) as e:
+        logger.warning(
+            "Partial file at frame %d during video writing: %s", frame_idx, e,
+        )
+
+    # Flush encoder
+    for packet in out_stream.encode():
+        out_container.mux(packet)
+
+    out_container.close()
+    in_container.close()
+
+    try:
+        os.chmod(output_path, 0o644)
+    except OSError:
+        pass
+
+    progress_bar.progress(1.0, text="Annotated video saved")
+    status_text.text(f"Annotated video written to {output_path}")
+    logger.info("Annotated video saved to %s", output_path)
+
+
+def _apply_fight_overlay(img: np.ndarray, confidence: float) -> np.ndarray:
+    """Apply red highlight overlay to a single RGB frame.
+
+    Args:
+        img: Frame array (H, W, 3) uint8 RGB.
+        confidence: Detection confidence for display.
+
+    Returns:
+        Annotated frame (H, W, 3) uint8 RGB.
+    """
+    h, w = img.shape[:2]
+    display = img.copy()
+
+    # Semi-transparent red tint
+    red = np.zeros_like(display)
+    red[:, :, 0] = 255
+    alpha = 0.18
+    display = cv2.addWeighted(display, 1 - alpha, red, alpha, 0)
+
+    # Red border
+    border = 5
+    display[:border, :] = [255, 0, 0]
+    display[-border:, :] = [255, 0, 0]
+    display[:, :border] = [255, 0, 0]
+    display[:, -border:] = [255, 0, 0]
+
+    # Convert to BGR for OpenCV text drawing, then back
+    bgr = cv2.cvtColor(display, cv2.COLOR_RGB2BGR)
+
+    # Warning banner background
+    warning_text = "WARNING: FIGHTING DETECTED"
+    text_size = cv2.getTextSize(warning_text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)[0]
+    text_x = (w - text_size[0]) // 2
+    text_y = h - 40
+
+    cv2.rectangle(
+        bgr,
+        (text_x - 12, text_y - text_size[1] - 12),
+        (text_x + text_size[0] + 12, text_y + 12),
+        (0, 0, 255), -1,
+    )
+    cv2.putText(
+        bgr, warning_text,
+        (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+        (255, 255, 255), 2, cv2.LINE_AA,
+    )
+
+    # Confidence text
+    conf_text = f"Confidence: {confidence:.1%}"
+    conf_size = cv2.getTextSize(conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+    conf_x = (w - conf_size[0]) // 2
+    conf_y = text_y - text_size[1] - 25
+    cv2.putText(
+        bgr, conf_text,
+        (conf_x, conf_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+        (0, 0, 255), 2, cv2.LINE_AA,
+    )
+
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def build_fight_timeline(
+    frame_results: List[Dict],
+    highlight_map: List[bool],
+    fps: float,
+) -> List[Dict]:
+    """Build a list of fight segments for display.
+
+    Returns:
+        List of dicts with 'start_sec', 'end_sec', 'start_frame', 'end_frame'.
+    """
+    segments = []
+    in_segment = False
+    start = 0
+
+    for i, is_fight in enumerate(highlight_map):
+        if is_fight and not in_segment:
+            start = i
+            in_segment = True
+        elif not is_fight and in_segment:
+            segments.append({
+                "start_frame": start,
+                "end_frame": i - 1,
+                "start_sec": start / fps,
+                "end_sec": (i - 1) / fps,
+            })
+            in_segment = False
+
+    if in_segment:
+        segments.append({
+            "start_frame": start,
+            "end_frame": len(highlight_map) - 1,
+            "start_sec": start / fps,
+            "end_sec": (len(highlight_map) - 1) / fps,
+        })
+
+    return segments
+
+
+def format_time(seconds: float) -> str:
+    """Format seconds as MM:SS."""
+    m = int(seconds) // 60
+    s = int(seconds) % 60
+    return f"{m:02d}:{s:02d}"
 
 
 def main():
@@ -180,13 +442,25 @@ def main():
 
     setup_logger("root")
     config = get_config()
-    init_session_state()
+
+    # Session state defaults
+    defaults = {
+        "detection_done": False,
+        "output_video_path": None,
+        "fight_segments": [],
+        "total_frames": 0,
+        "video_fps": 30.0,
+        "frame_results": [],
+        "processing": False,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
     # Header
     st.title("Fighting Behavior Detection System")
-    st.markdown("Real-time abnormal behavior detection using deep learning")
 
-    # Sidebar controls
+    # Sidebar
     with st.sidebar:
         st.header("Configuration")
 
@@ -195,7 +469,6 @@ def main():
             options=["Video File", "RTSP Stream"],
             index=0,
         )
-        st.session_state.source_type = source_type
 
         if source_type == "Video File":
             video_path = st.text_input(
@@ -208,11 +481,14 @@ def main():
                 type=["mp4", "avi", "mkv", "mov"],
             )
             if uploaded is not None:
-                # Save uploaded file temporarily
                 temp_path = Path("data/temp_upload.mp4")
                 temp_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(temp_path, "wb") as f:
                     f.write(uploaded.read())
+                try:
+                    os.chmod(temp_path, 0o644)
+                except OSError:
+                    pass
                 source = str(temp_path)
             else:
                 source = video_path
@@ -223,11 +499,8 @@ def main():
                 placeholder="rtsp://192.168.1.100:554/stream",
             )
 
-        st.session_state.source = source
-
         st.markdown("---")
 
-        # Detection settings
         st.subheader("Detection Settings")
         threshold = st.slider(
             "Confidence Threshold",
@@ -238,91 +511,166 @@ def main():
         )
         config.inference.confidence_threshold = threshold
 
+        warning_duration = st.slider(
+            "Warning duration (frames)",
+            min_value=5,
+            max_value=120,
+            value=config.inference.get("warning_display_frames", 30),
+            step=5,
+            help="How many frames the red highlight persists after a fight detection.",
+        )
+
         st.markdown("---")
 
-        # Control buttons
-        col1, col2 = st.columns(2)
-        with col1:
-            start_button = st.button(
-                "Start Detection",
-                disabled=st.session_state.running or not source,
-                use_container_width=True,
-            )
-        with col2:
-            stop_button = st.button(
-                "Stop",
-                disabled=not st.session_state.running,
-                use_container_width=True,
-            )
+        detect_button = st.button(
+            "Run Detection",
+            disabled=(
+                st.session_state.processing
+                or st.session_state.detection_done
+                or not source
+            ),
+            width="stretch",
+        )
 
-        if start_button and source:
-            start_detection(config, source)
-            st.rerun()
+        if st.session_state.detection_done:
+            reset_button = st.button("Reset", width="stretch")
+            if reset_button:
+                st.session_state.detection_done = False
+                st.session_state.output_video_path = None
+                st.session_state.fight_segments = []
+                st.session_state.frame_results = []
+                st.rerun()
 
-        if stop_button:
-            stop_detection()
-            st.rerun()
-
-        # Status
+        # Model info
         st.markdown("---")
-        st.subheader("Status")
-        if st.session_state.running:
-            st.success("Detection is running")
-            reader = st.session_state.reader
-            if reader is not None:
-                st.text(f"Source: {reader.source}")
-                st.text(f"Buffer: {reader.get_buffer_size()} frames")
-                st.text(f"Processed: {st.session_state.frame_counter} frames")
-        else:
-            st.info("Detection stopped")
+        with st.expander("Model Information"):
+            st.markdown(
+                f"- **Architecture**: {config.model.name}\n"
+                f"- **Input**: {config.model.clip_length} frames @ "
+                f"{config.model.spatial_size}x{config.model.spatial_size}\n"
+                f"- **Classes**: Normal, Fight\n"
+                f"- **Threshold**: {threshold:.0%}"
+            )
 
-    # Main content area
-    if st.session_state.running:
-        # Create placeholders
-        frame_placeholder = st.empty()
-        status_placeholder = st.empty()
+    # Main area
+    if detect_button and source:
+        st.session_state.processing = True
+        st.session_state.detection_done = False
 
-        while st.session_state.running:
-            display = process_and_annotate(config)
+        try:
+            # Phase 1: Detection
+            st.subheader("Phase 1: Analyzing video")
+            detect_progress = st.progress(0.0, text="Starting detection...")
+            detect_status = st.empty()
 
-            if display is not None:
-                frame_placeholder.image(
-                    display,
-                    channels="RGB",
-                    use_container_width=True,
+            frame_results, total_frames, fps, w, h = run_detection(
+                source, config, detect_progress, detect_status,
+            )
+            fps = _sanitize_fps(fps)
+
+            # Propagate fight labels
+            highlight_map = propagate_fight_labels(frame_results, warning_duration)
+            fight_segments = build_fight_timeline(frame_results, highlight_map, fps)
+
+            fight_frame_count = sum(highlight_map)
+            detect_status.text(
+                f"Detection complete: {total_frames} frames, "
+                f"{fight_frame_count} frames flagged as fighting "
+                f"({len(fight_segments)} segment(s))"
+            )
+
+            # Phase 2: Write annotated video
+            st.subheader("Phase 2: Writing annotated video")
+            write_progress = st.progress(0.0, text="Starting encoding...")
+            write_status = st.empty()
+
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            output_path = str(OUTPUT_DIR / "annotated_output.mp4")
+
+            write_annotated_video(
+                source, highlight_map, frame_results,
+                output_path, fps, write_progress, write_status,
+            )
+
+            # Store results in session state
+            st.session_state.output_video_path = output_path
+            st.session_state.fight_segments = fight_segments
+            st.session_state.total_frames = total_frames
+            st.session_state.video_fps = fps
+            st.session_state.frame_results = frame_results
+            st.session_state.detection_done = True
+        except Exception as e:
+            logger.exception("Detection pipeline failed")
+            st.error(f"Detection failed: {e}")
+            st.exception(e)
+            st.session_state.detection_done = False
+        finally:
+            st.session_state.processing = False
+
+        # Render results immediately in this same run — no st.rerun()
+        if st.session_state.detection_done and st.session_state.output_video_path:
+            st.markdown("---")
+            st.subheader("Detection Results")
+            st.info(f"Output video: `{st.session_state.output_video_path}`")
+            video_file = open(st.session_state.output_video_path, "rb")
+            st.video(video_file)
+
+            st.subheader("Detected Fight Segments")
+            fight_segments = st.session_state.fight_segments
+            total_frames = st.session_state.total_frames
+            fps = _sanitize_fps(st.session_state.video_fps)
+            if fight_segments:
+                duration = total_frames / fps if fps else 0
+                st.warning(
+                    f"{len(fight_segments)} fight segment(s) detected "
+                    f"in {format_time(duration)} of video"
                 )
+                for i, seg in enumerate(fight_segments, 1):
+                    seg_duration = seg["end_sec"] - seg["start_sec"]
+                    st.markdown(
+                        f"**Segment {i}**: "
+                        f"{format_time(seg['start_sec'])} - {format_time(seg['end_sec'])} "
+                        f"({seg_duration:.1f}s, "
+                        f"frames {seg['start_frame']}-{seg['end_frame']})"
+                    )
+            else:
+                st.success("No fighting behavior detected in this video.")
 
-                result = st.session_state.last_result
-                if result is not None:
-                    if result["is_fight"] or st.session_state.warning_countdown > 0:
-                        status_placeholder.error(
-                            "WARNING: FIGHTING DETECTED "
-                            f"(confidence: {result['confidence']:.1%})"
-                        )
-                    else:
-                        status_placeholder.success(
-                            f"Status: Normal "
-                            f"(fight probability: {result['probabilities'].get('fight', 0):.1%})"
-                        )
+    elif st.session_state.detection_done and st.session_state.output_video_path:
+        output_path = st.session_state.output_video_path
+        segments = st.session_state.fight_segments
+        fps = st.session_state.video_fps
+        total = st.session_state.total_frames
 
-            time.sleep(0.03)  # ~30 FPS display rate
+        st.subheader("Detection Results")
+        st.info(f"Output video: `{output_path}`")
+        video_file = open(output_path, "rb")
+        st.video(video_file)
+
+        st.subheader("Detected Fight Segments")
+        if segments:
+            duration = total / fps if fps else 0
+            st.warning(
+                f"{len(segments)} fight segment(s) detected "
+                f"in {format_time(duration)} of video"
+            )
+            for i, seg in enumerate(segments, 1):
+                seg_duration = seg["end_sec"] - seg["start_sec"]
+                st.markdown(
+                    f"**Segment {i}**: "
+                    f"{format_time(seg['start_sec'])} - {format_time(seg['end_sec'])} "
+                    f"({seg_duration:.1f}s, "
+                    f"frames {seg['start_frame']}-{seg['end_frame']})"
+                )
+        else:
+            st.success("No fighting behavior detected in this video.")
 
     else:
         st.info(
-            "Select a video source and click 'Start Detection' to begin. "
-            "The system will analyze video frames for fighting behavior "
-            "and display a red warning when fighting is detected."
+            "Select a video source and click **Run Detection** to begin. "
+            "The system will analyze the entire video, then play back "
+            "the result with red highlights on segments where fighting was detected."
         )
-
-        # Show model info
-        with st.expander("Model Information"):
-            st.markdown(f"""
-            - **Architecture**: {config.model.name}
-            - **Input Resolution**: {config.model.spatial_size}x{config.model.spatial_size}
-            - **Clip Length**: {config.model.clip_length} frames
-            - **Classes**: Normal, Fight
-            - **Confidence Threshold**: {config.inference.get('confidence_threshold', 0.6):.0%}
-            """)
 
 
 if __name__ == "__main__":

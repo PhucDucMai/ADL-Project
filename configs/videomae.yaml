@@ -1,0 +1,63 @@
+# Configuration for VideoMAE Fighting Detection
+
+model:
+  # Model architecture
+  name: "videomae"
+  source: "huggingface"  # Load from HuggingFace
+  num_classes: 2
+  pretrained: true
+  # VideoMAE optimal settings (ViT-based, efficient)
+  clip_length: 16      # VideoMAE uses 16 frames
+  frame_stride: 2
+  spatial_size: 224    # VideoMAE uses 224×224
+  dropout_rate: 0.5
+
+training:
+  batch_size: 8        # Can handle larger batch due to efficiency
+  num_epochs: 20
+  learning_rate: 0.005
+  weight_decay: 0.00005
+  optimizer: "adamw"   # Recommended for ViT
+  momentum: 0.9
+  lr_scheduler: "cosine"
+  warmup_epochs: 5
+  mixed_precision: true
+  num_workers: 4
+  checkpoint_dir: "checkpoints/videomae/"
+  log_dir: "logs/videomae/"
+  save_interval: 5
+  val_interval: 1
+  gradient_clip_norm: 1.0
+  label_smoothing: 0.1
+  freeze_backbone_epochs: 3
+
+data:
+  train_dir: "data/raw/train"
+  val_dir: "data/raw/val"
+  test_dir: "data/raw/test"
+  clip_length: 16      # Match model
+  frame_stride: 2
+  spatial_size: 224    # Match model
+  classes:
+    - "normal"
+    - "fight"
+  random_horizontal_flip: true
+  color_jitter: true
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.2
+  color_jitter_hue: 0.1
+  random_crop_scale_min: 0.8
+  random_crop_scale_max: 1.0
+
+inference:
+  model_path: "checkpoints/videomae/best_model.pth"
+  confidence_threshold: 0.6
+  device: "cuda"
+  clip_length: 16
+  frame_stride: 2
+  spatial_size: 224
+  buffer_size: 64
+  inference_interval: 4
+  warning_display_frames: 30
+  temporal_smoothing_window: 3

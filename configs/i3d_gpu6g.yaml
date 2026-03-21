@@ -1,0 +1,67 @@
+# Configuration for I3D Fighting Detection (Optimized for 6GB GPU)
+
+model:
+  name: "i3d"
+  source: "torch_hub"
+  num_classes: 2
+  pretrained: true
+  clip_length: 32      # Smaller than default to fit 6GB
+  frame_stride: 2
+  spatial_size: 224
+  dropout_rate: 0.5
+
+training:
+  batch_size: 1        # OPTIMIZED: Very small batch due to large model (I3D is ~214MB)
+  num_epochs: 20
+  learning_rate: 0.005
+  weight_decay: 0.00005
+  optimizer: "sgd"
+  momentum: 0.9
+  lr_scheduler: "cosine"
+  warmup_epochs: 5
+  mixed_precision: true
+  amp_dtype: "float16"
+  num_workers: 1       # Minimal workers to save memory
+  pin_memory: false
+  checkpoint_dir: "checkpoints/i3d/"
+  log_dir: "logs/i3d/"
+  save_interval: 5
+  val_interval: 1
+  gradient_clip_norm: 1.0
+  label_smoothing: 0.1
+  freeze_backbone_epochs: 5
+
+  # Gradient accumulation to compensate for tiny batch
+  gradient_accumulation_steps: 8  # Simulates batch_size=8 (1*8)
+
+  # Memory optimization
+  max_grad_norm: 1.0
+  cudnn_benchmark: true
+
+data:
+  train_dir: "data/raw/train"
+  val_dir: "data/raw/val"
+  test_dir: "data/raw/test"
+  clip_length: 32
+  frame_stride: 2
+  spatial_size: 224
+  classes:
+    - "normal"
+    - "fight"
+  random_horizontal_flip: true
+  color_jitter: false
+  random_crop_scale_min: 0.8
+  random_crop_scale_max: 1.0
+  prefetch_factor: 1
+
+inference:
+  model_path: "checkpoints/i3d/best_model.pth"
+  confidence_threshold: 0.6
+  device: "cuda"
+  clip_length: 32
+  frame_stride: 2
+  spatial_size: 224
+  buffer_size: 32
+  inference_interval: 8
+  warning_display_frames: 30
+  temporal_smoothing_window: 3

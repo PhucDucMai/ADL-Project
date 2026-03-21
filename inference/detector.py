@@ -80,28 +80,222 @@ class FightDetector:
         Returns:
             Loaded model in eval mode.
         """
-        model = create_model(self.config)
+        checkpoint_candidates = self._resolve_checkpoint_candidates(model_path)
+        model_pretrained = bool(self.config.model.get("pretrained", True))
 
-        checkpoint_path = Path(model_path)
-        if checkpoint_path.exists():
-            logger.info("Loading model weights from: %s", model_path)
-            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-
-            if "model_state_dict" in checkpoint:
-                model.load_state_dict(checkpoint["model_state_dict"])
-            else:
-                model.load_state_dict(checkpoint)
-
-            logger.info("Model weights loaded successfully")
+        if checkpoint_candidates and model_pretrained:
+            logger.info(
+                "Checkpoint detected. Building model with pretrained=False to avoid "
+                "external weight downloads during inference."
+            )
+            self.config.model.pretrained = False
+            try:
+                model = create_model(self.config)
+            finally:
+                self.config.model.pretrained = model_pretrained
         else:
+            try:
+                model = create_model(self.config)
+            except Exception as e:
+                if not model_pretrained:
+                    raise
+                logger.warning(
+                    "Pretrained model initialization failed (%s). "
+                    "Retrying with pretrained=False.",
+                    e,
+                )
+                self.config.model.pretrained = False
+                try:
+                    model = create_model(self.config)
+                finally:
+                    self.config.model.pretrained = model_pretrained
+
+        loaded = False
+        for checkpoint_path in checkpoint_candidates:
+            logger.info("Loading model weights from: %s", checkpoint_path)
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+                state_dict = self._extract_state_dict(checkpoint)
+                filtered_state_dict, load_stats = self._adapt_state_dict_for_model(model, state_dict)
+
+                if load_stats["matched"] == 0:
+                    logger.warning(
+                        "Skipping incompatible checkpoint (0 matched tensors): %s",
+                        checkpoint_path,
+                    )
+                    continue
+
+                load_result = model.load_state_dict(filtered_state_dict, strict=False)
+                logger.info(
+                    "Model weights loaded: matched=%d/%d (missing=%d, unexpected=%d)",
+                    load_stats["matched"],
+                    load_stats["target_total"],
+                    len(load_result.missing_keys),
+                    len(load_result.unexpected_keys),
+                )
+                if load_stats["matched"] < max(1, int(0.5 * load_stats["target_total"])):
+                    logger.warning(
+                        "Only partial checkpoint load was possible (%d/%d tensors). "
+                        "This often means model mismatch or classifier-head size mismatch.",
+                        load_stats["matched"],
+                        load_stats["target_total"],
+                    )
+                loaded = True
+                break
+            except Exception as e:
+                logger.warning("Failed to load checkpoint %s: %s", checkpoint_path, e)
+
+        if checkpoint_candidates and not loaded:
             logger.warning(
-                "Checkpoint not found at %s. Using model with pretrained backbone only.",
+                "No compatible checkpoint could be loaded from %d candidate(s). "
+                "Continuing with model initialized from current config.",
+                len(checkpoint_candidates),
+            )
+        elif not checkpoint_candidates:
+            logger.warning(
+                "Checkpoint not found at %s (or discoverable alternatives). "
+                "Using model with pretrained backbone only.",
                 model_path,
             )
 
         model = model.to(self.device)
         model.eval()
         return model
+
+    def _resolve_checkpoint_candidates(self, model_path: str) -> list[Path]:
+        """Resolve checkpoint candidates, with automatic fallback discovery.
+
+        Supports explicit files and run-organized training outputs like:
+        checkpoints/<model_name>/<run_id>/best_model.pth
+        """
+        explicit_path = Path(model_path)
+        explicit_candidates = []
+        if explicit_path.exists() and explicit_path.is_file():
+            explicit_candidates.append(explicit_path)
+
+        model_name = str(self.config.model.name)
+        search_roots = []
+
+        training_cfg = getattr(self.config, "training", None)
+        if training_cfg is not None:
+            checkpoint_root = training_cfg.get("checkpoint_dir", None)
+            if checkpoint_root:
+                search_roots.append(Path(checkpoint_root))
+
+        search_roots.append(Path("checkpoints"))
+
+        candidates = []
+        for root in search_roots:
+            if not root.exists():
+                continue
+
+            patterns = [
+                f"{model_name}/**/best_model.pth",
+                f"{model_name}/**/final_model.pth",
+                f"{model_name}/best_model.pth",
+                f"{model_name}/final_model.pth",
+                "best_model.pth",
+                "final_model.pth",
+            ]
+
+            for pattern in patterns:
+                for p in root.glob(pattern):
+                    if p.is_file():
+                        candidates.append(p)
+
+        if not candidates:
+            return explicit_candidates
+
+        candidates = sorted(
+            set(candidates),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        combined = []
+        seen = set()
+        for p in explicit_candidates + candidates:
+            if p not in seen:
+                combined.append(p)
+                seen.add(p)
+
+        if combined and not explicit_candidates:
+            logger.warning(
+                "Configured checkpoint '%s' not found. Trying auto-discovered candidates "
+                "starting with latest: %s",
+                model_path,
+                combined[0],
+            )
+        return combined
+
+    @staticmethod
+    def _extract_state_dict(checkpoint) -> Dict:
+        """Extract state dict from common checkpoint formats."""
+        if isinstance(checkpoint, dict):
+            for key in ("model_state_dict", "state_dict", "model"):
+                value = checkpoint.get(key)
+                if isinstance(value, dict):
+                    return value
+            # Raw state dict case
+            if checkpoint and all(torch.is_tensor(v) for v in checkpoint.values()):
+                return checkpoint
+        raise RuntimeError(
+            "Unsupported checkpoint format. Expected one of keys: "
+            "'model_state_dict', 'state_dict', or raw tensor state dict."
+        )
+
+    @staticmethod
+    def _adapt_state_dict_for_model(model: nn.Module, state_dict: Dict) -> Tuple[Dict, Dict[str, int]]:
+        """Map checkpoint tensors to current model keys with shape validation."""
+        target_state = model.state_dict()
+
+        def strip_prefix(sd: Dict, prefix: str) -> Dict:
+            return {
+                (k[len(prefix):] if k.startswith(prefix) else k): v
+                for k, v in sd.items()
+            }
+
+        variants = []
+        variants.append(("raw", state_dict))
+
+        no_module = strip_prefix(state_dict, "module.")
+        variants.append(("no_module", no_module))
+
+        no_module_no_model = strip_prefix(no_module, "model.")
+        variants.append(("no_module_no_model", no_module_no_model))
+
+        add_model_prefix = {f"model.{k}": v for k, v in no_module.items()}
+        variants.append(("add_model_prefix", add_model_prefix))
+
+        best_name = "raw"
+        best_match_count = -1
+        best_matched = {}
+
+        for variant_name, sd_variant in variants:
+            matched = {}
+            for k, v in sd_variant.items():
+                if k not in target_state:
+                    continue
+                if target_state[k].shape != v.shape:
+                    continue
+                matched[k] = v
+
+            if len(matched) > best_match_count:
+                best_match_count = len(matched)
+                best_name = variant_name
+                best_matched = matched
+
+        logger.info(
+            "Checkpoint key adaptation selected variant '%s' (%d matched tensors)",
+            best_name,
+            len(best_matched),
+        )
+
+        stats = {
+            "matched": len(best_matched),
+            "source_total": len(state_dict),
+            "target_total": len(target_state),
+        }
+        return best_matched, stats
 
     @torch.no_grad()
     def predict_clip(self, frames: np.ndarray) -> Dict:

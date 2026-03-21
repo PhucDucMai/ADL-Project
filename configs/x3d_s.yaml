@@ -1,0 +1,61 @@
+# Configuration for X3D-S Fighting Detection
+
+model:
+  name: "x3d_s"
+  source: "torch_hub"
+  num_classes: 2
+  pretrained: true
+  clip_length: 13
+  frame_stride: 2
+  spatial_size: 182
+  dropout_rate: 0.5
+
+training:
+  batch_size: 8
+  num_epochs: 30
+  learning_rate: 0.005
+  weight_decay: 0.00005
+  optimizer: "sgd"
+  momentum: 0.9
+  lr_scheduler: "cosine"
+  warmup_epochs: 5
+  mixed_precision: true
+  num_workers: 4
+  checkpoint_dir: "checkpoints/"
+  log_dir: "logs/"
+  save_interval: 5
+  val_interval: 1
+  gradient_clip_norm: 1.0
+  label_smoothing: 0.1
+  freeze_backbone_epochs: 5
+
+data:
+  train_dir: "data/raw/train"
+  val_dir: "data/raw/val"
+  test_dir: "data/raw/test"
+  clip_length: 13
+  frame_stride: 2
+  spatial_size: 182
+  classes:
+    - "normal"
+    - "fight"
+  random_horizontal_flip: true
+  color_jitter: true
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.2
+  color_jitter_hue: 0.1
+  random_crop_scale_min: 0.8
+  random_crop_scale_max: 1.0
+
+inference:
+  model_path: "checkpoints/x3d_s/best_model.pth"
+  confidence_threshold: 0.6
+  device: "cuda"
+  clip_length: 13
+  frame_stride: 2
+  spatial_size: 182
+  buffer_size: 64
+  inference_interval: 8
+  warning_display_frames: 30
+  temporal_smoothing_window: 3

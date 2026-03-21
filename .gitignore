@@ -32,12 +32,14 @@ data/temp_upload.*
 !data/raw/val/normal/.gitkeep
 
 # Model checkpoints
-checkpoints/*.pth
+checkpoints/**/*.pth
+checkpoints/**/*.pt
+checkpoints/**/*.ckpt
 
 # Logs (generated during training)
-logs/*.log
-logs/*.png
-logs/*.json
+logs/**/*.log
+logs/**/*.png
+logs/**/*.json
 
 # OS files
 .DS_Store

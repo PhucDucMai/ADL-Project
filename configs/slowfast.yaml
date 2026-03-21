@@ -1,0 +1,63 @@
+# Configuration for SlowFast Fighting Detection
+
+model:
+  # Model architecture
+  name: "slowfast"
+  source: "torchvision"  # Load from torchvision
+  num_classes: 2
+  pretrained: true
+  # SlowFast optimal settings (Slow: 8 frames, Fast: 32 frames, alpha=8)
+  clip_length: 64      # Total frames (8 slow + 32 fast via internal handling)
+  frame_stride: 2
+  spatial_size: 224    # SlowFast uses 224×224
+  dropout_rate: 0.5
+
+training:
+  batch_size: 4        # Reduced due to dual-path architecture
+  num_epochs: 20
+  learning_rate: 0.005
+  weight_decay: 0.00005
+  optimizer: "sgd"
+  momentum: 0.9
+  lr_scheduler: "cosine"
+  warmup_epochs: 5
+  mixed_precision: true
+  num_workers: 4
+  checkpoint_dir: "checkpoints/slowfast/"
+  log_dir: "logs/slowfast/"
+  save_interval: 5
+  val_interval: 1
+  gradient_clip_norm: 1.0
+  label_smoothing: 0.1
+  freeze_backbone_epochs: 5
+
+data:
+  train_dir: "data/raw/train"
+  val_dir: "data/raw/val"
+  test_dir: "data/raw/test"
+  clip_length: 64      # Match model
+  frame_stride: 2
+  spatial_size: 224    # Match model
+  classes:
+    - "normal"
+    - "fight"
+  random_horizontal_flip: true
+  color_jitter: true
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.2
+  color_jitter_hue: 0.1
+  random_crop_scale_min: 0.8
+  random_crop_scale_max: 1.0
+
+inference:
+  model_path: "checkpoints/slowfast/best_model.pth"
+  confidence_threshold: 0.6
+  device: "cuda"
+  clip_length: 64
+  frame_stride: 2
+  spatial_size: 224
+  buffer_size: 128
+  inference_interval: 8
+  warning_display_frames: 30
+  temporal_smoothing_window: 3

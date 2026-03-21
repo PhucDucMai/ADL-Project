@@ -1,0 +1,66 @@
+# Configuration for VideoMAE Fighting Detection (Optimized for 6GB GPU)
+
+model:
+  name: "videomae"
+  source: "huggingface"
+  num_classes: 2
+  pretrained: true
+  clip_length: 16
+  frame_stride: 2
+  spatial_size: 224
+  dropout_rate: 0.5
+
+training:
+  batch_size: 3        # Lighter model, can use slightly larger batch
+  num_epochs: 20
+  learning_rate: 0.005
+  weight_decay: 0.00005
+  optimizer: "adamw"   # AdamW recommended for transformers
+  momentum: 0.9        # Not used by AdamW but kept for compatibility
+  lr_scheduler: "cosine"
+  warmup_epochs: 5
+  mixed_precision: true
+  amp_dtype: "float16"
+  num_workers: 2
+  pin_memory: false
+  checkpoint_dir: "checkpoints/videomae/"
+  log_dir: "logs/videomae/"
+  save_interval: 5
+  val_interval: 1
+  gradient_clip_norm: 1.0
+  label_smoothing: 0.1
+  freeze_backbone_epochs: 3
+
+  # Smaller accumulation steps since we use larger batch
+  gradient_accumulation_steps: 2  # Simulates batch_size=6 (3*2)
+
+  max_grad_norm: 1.0
+  cudnn_benchmark: true
+
+data:
+  train_dir: "data/raw/train"
+  val_dir: "data/raw/val"
+  test_dir: "data/raw/test"
+  clip_length: 16
+  frame_stride: 2
+  spatial_size: 224
+  classes:
+    - "normal"
+    - "fight"
+  random_horizontal_flip: true
+  color_jitter: false
+  random_crop_scale_min: 0.8
+  random_crop_scale_max: 1.0
+  prefetch_factor: 1
+
+inference:
+  model_path: "checkpoints/videomae/best_model.pth"
+  confidence_threshold: 0.6
+  device: "cuda"
+  clip_length: 16
+  frame_stride: 2
+  spatial_size: 224
+  buffer_size: 64
+  inference_interval: 8
+  warning_display_frames: 30
+  temporal_smoothing_window: 3
